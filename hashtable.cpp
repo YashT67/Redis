@@ -1,6 +1,6 @@
 #include <assert.h>
 #include <stdlib.h> // calloc(), free()
-#include "09_hashtable.h"
+#include "hashtable.h"
 
 // Allocate memory using calloc
 static void h_init(HTab *htab, size_t n)
