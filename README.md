@@ -5,6 +5,7 @@ A lightweight, in-memory data store built from scratch in C++, supporting string
 ## 🏗️ Architecture & Key Features
 
 * **Event-Driven Networking:** The server uses a single-threaded event loop with non-blocking I/O using `poll()` to efficiently handle multiple client connections concurrently.
+* **Idle Connection Management:** Implemented an efficient timer system using an intrusive doubly linked list to track client activity. Idle connections are automatically evicted to prevent resource exhaustion, with timer updates operating in $O(1)$ time.
 * **Custom Binary Protocol:** The client and server communicate via a custom networking protocol that serializes requests and responses using explicit data tags (Strings, Integers, Doubles, Arrays, Errors).
 * **Progressive Rehashing:** The custom hash map implementation prevents latency spikes by gradually migrating keys between an "older" and "newer" table during resizing.
 * **Intrusive Data Structures:** Memory efficiency is optimized by using an intrusive approach with the `container_of` macro to link structures, reducing allocation overhead.
@@ -14,6 +15,7 @@ A lightweight, in-memory data store built from scratch in C++, supporting string
 * **Hash Table:** Used for the top-level database to store and retrieve all keys in average constant time.
 * **AVL Tree:** A self-balancing binary search tree used to maintain the heights and subtree sizes (counts) of sorted data.
 * **Sorted Sets (ZSet):** Implemented using a dual-structure approach, combining a hash map for rapid score lookups by name, and an AVL tree to order tuples by score for fast range queries.
+* **Doubly Linked List:** A custom intrusive doubly linked list (`DList`) used as a queue to manage connection timers, natively ordering them by their last active timestamp for fast expiration.
 
 ## 🚀 Supported Commands
 
