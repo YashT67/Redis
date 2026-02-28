@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <math.h> // To check if is Not a Number / isnan()
 // system
+#include <time.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
@@ -22,6 +23,7 @@ using namespace std;
 #include "hashtable.h"
 #include "zset.h"
 #include "common.h"
+#include "list.h"
 
 #define container_of(ptr, T, member) \
     ((T *)((char *)ptr - offsetof(T, member)))
@@ -36,6 +38,13 @@ static void die(const char *msg)
 {
     fprintf(stderr, "[%d] %s", errno, msg);
     abort();
+}
+
+static uint64_t get_monotonic_msec()
+{
+    struct timespec tv = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1e6;
 }
 
 static void fd_set_nb(int fd)
@@ -69,7 +78,19 @@ struct Conn
     // Buffered input and output
     Buffer incoming;
     Buffer outgoing;
+
+    // Timer
+    uint64_t last_active_msec = 0;
+    DList idle_node;
 };
+
+// Global states
+static struct
+{
+    HMap db;                // Top-level hashtable
+    vector<Conn *> fd2conn; // A map of all client connections keyed by fd
+    DList idle_list;        // Timers for idle connections
+} g_data;
 
 // Append to the back
 static void buf_append(Buffer &buf, const uint8_t *data, size_t len)
@@ -84,7 +105,7 @@ static void buf_consume(Buffer &buf, size_t n)
 }
 
 // Application callback when the listening sockte is ready
-static Conn *handle_accept(int fd)
+static int32_t handle_accept(int fd)
 {
     // Accept
     struct sockaddr_in client_addr = {};
@@ -105,7 +126,23 @@ static Conn *handle_accept(int fd)
     Conn *conn = new Conn();
     conn->fd = connfd;
     conn->want_read = true;
-    return conn;
+    conn->last_active_msec = get_monotonic_msec();
+    dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+
+    // Put it in the map
+    if (g_data.fd2conn.size() <= conn->fd)
+        g_data.fd2conn.resize(conn->fd + 1);
+    assert(!g_data.fd2conn[conn->fd]);
+    g_data.fd2conn[conn->fd] = conn;
+    return 0;
+}
+
+static void conn_destroy(Conn *conn)
+{
+    (void)close(conn->fd);
+    g_data.fd2conn[conn->fd] = NULL;
+    dlist_detach(&conn->idle_node);
+    delete conn;
 }
 
 const size_t max_args = 128 * 1024;
@@ -229,12 +266,6 @@ static void out_end_arr(Buffer &out, size_t ctx, uint32_t n)
     assert(out[ctx - 1] == TAG_ARR);
     memcpy(&out[ctx], &n, 4);
 }
-
-// Global states
-static struct
-{
-    HMap db; // Top-level hashtable
-} g_data;
 
 // Value types
 enum
@@ -612,7 +643,7 @@ static void handle_read(Conn *conn)
     }
 
     buf_append(conn->incoming, buf, (size_t)rv); // Input the new data
-    while (try_one_request(conn)) // Parse request and generate response
+    while (try_one_request(conn))                // Parse request and generate response
     {
     }
 
@@ -623,6 +654,35 @@ static void handle_read(Conn *conn)
         conn->want_write = true;
         handle_write(conn);
     } // else read again
+}
+
+const uint64_t max_idle_time_ms = 64 * 128;
+
+static int32_t next_timer_ms()
+{
+    if (dlist_empty(&g_data.idle_list)) // No timer or timeouts
+        return -1;
+
+    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    uint64_t now_ms = get_monotonic_msec();
+    uint64_t next_ms = conn->last_active_msec + max_idle_time_ms;
+    if (next_ms <= now_ms) // Missed
+        return 0;
+    return (next_ms - now_ms);
+}
+
+static void process_timers()
+{
+    uint64_t now_ms = get_monotonic_msec();
+    while (!dlist_empty(&g_data.idle_list))
+    {
+        Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+        uint64_t next_ms = conn->last_active_msec + max_idle_time_ms;
+        if (next_ms >= now_ms) // Not expired
+            break;
+        fprintf(stderr, "Removing idle connection: %d.\n", conn->fd);
+        conn_destroy(conn);
+    }
 }
 
 int main()
@@ -651,7 +711,6 @@ int main()
     if (rv < 0)
         die("listen error");
 
-    vector<Conn *> fd2conn; // Map of all connections, keyed by fd
     vector<struct pollfd> poll_args;
 
     // The event loop
@@ -662,7 +721,7 @@ int main()
         struct pollfd pfd = {fd, POLLIN, 0};
         poll_args.push_back(pfd);
         // Rest are connection sockets
-        for (Conn *conn : fd2conn)
+        for (Conn *conn : g_data.fd2conn)
         {
             if (!conn)
                 continue;
@@ -675,7 +734,8 @@ int main()
         }
 
         // Wait for readiness
-        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
+        int32_t timeout_ms = next_timer_ms();
+        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
         if (rv < 0 && errno == EINTR)
             continue;
         else if (rv < 0)
@@ -683,15 +743,7 @@ int main()
 
         // Handle the listening socket
         if (poll_args[0].revents)
-        {
-            if (Conn *conn = handle_accept(fd))
-            {
-                if (fd2conn.size() <= (size_t)conn->fd)
-                    fd2conn.resize(conn->fd + 1);
-                assert(!fd2conn[conn->fd]);
-                fd2conn[conn->fd] = conn;
-            }
-        }
+            handle_accept(fd);
 
         // Handle connection sockets
         for (int i = 1; i < poll_args.size(); ++i) // Note: skip the 1st
@@ -699,8 +751,14 @@ int main()
             uint32_t ready = poll_args[i].revents;
             if (!ready)
                 continue;
+            Conn *conn = g_data.fd2conn[poll_args[i].fd];
 
-            Conn *conn = fd2conn[poll_args[i].fd];
+            // Update the idle timer by moving conn to the end of the list
+            uint64_t now_ms = get_monotonic_msec();
+            dlist_detach(&conn->idle_node);
+            dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+
+            // Handle IO
             if (ready & POLLIN)
             {
                 assert(conn->want_read);
@@ -712,12 +770,11 @@ int main()
                 handle_write(conn);
             }
             if ((ready & POLLERR) || conn->want_close)
-            {
-                (void)close(conn->fd);
-                fd2conn[conn->fd] = NULL;
-                delete conn;
-            }
-        }
+                conn_destroy(conn);
+        } // For each connection sockets
+
+        process_timers(); // Handle timers
+
     } // The event loop
     return 0;
 }
